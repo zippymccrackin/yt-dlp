@@ -649,6 +649,7 @@ from .funimation import (
     FunimationIE,
     FunimationPageIE,
     FunimationShowIE,
+    FunimationMetaIE,
 )
 from .funk import FunkIE
 from .funker530 import Funker530IE

@@ -91,19 +91,23 @@ class FunimationPageIE(FunimationBaseIE):
     def _real_extract(self, url):
         locale, show, episode = self._match_valid_url(url).group('lang', 'show', 'episode')
 
-        video_id = traverse_obj(self._download_json(
-            f'https://title-api.prd.funimationsvc.com/v1/shows/{show}/episodes/{episode}',
-            f'{show}_{episode}', query={
-                'deviceType': 'web',
-                'region': self._REGION,
-                'locale': locale or 'en'
-            }), ('videoList', ..., 'id'), get_all=False)
+        try:
+            video_id = traverse_obj(self._download_json(
+                f'https://title-api.prd.funimationsvc.com/v1/shows/{show}/episodes/{episode}',
+                f'{show}_{episode}', query={
+                    'deviceType': 'web',
+                    'region': self._REGION,
+                    'locale': locale or 'en'
+                }), ('videoList', ..., 'id'), get_all=False)
+        except ExtractorError as e:
+            if isinstance(e.cause, HTTPError) and e.cause.status == 404:
+                return self.url_result(f'https://d33et77evd9bgg.cloudfront.net/data/v1/episodes/{episode}.json', FunimationMetaIE.ie_key())
 
-        return self.url_result(f'https://www.funimation.com/player/{video_id}', FunimationIE.ie_key(), video_id)
+        return self.url_result(f'https://www.funimation.com/player/{video_id}?{episode}', FunimationIE.ie_key())
 
 
 class FunimationIE(FunimationBaseIE):
-    _VALID_URL = r'https?://(?:www\.)?funimation\.com/player/(?P<id>\d+)'
+    _VALID_URL = r'https?://(?:www\.)?funimation\.com/player/(?P<id>\d+)\??(?P<episode_slug>[^/?#&]+)?'
 
     _TESTS = [{
         'url': 'https://www.funimation.com/player/210051',
@@ -178,10 +182,12 @@ class FunimationIE(FunimationBaseIE):
         return {}, {}, {}
 
     def _real_extract(self, url):
-        initial_experience_id = self._match_id(url)
+        initial_experience_id, episode_slug = self._match_valid_url(url).group('id', 'episode_slug')
         webpage = self._download_webpage(
             url, initial_experience_id, note=f'Downloading player webpage for {initial_experience_id}')
-        episode, season, show = self._get_episode(webpage, experience_id=int(initial_experience_id))
+        episode, season, show = self._get_episode(webpage, experience_id=int(initial_experience_id), fatal=episode_slug==None)
+        if not episode:
+            return self.url_result(f'https://d33et77evd9bgg.cloudfront.net/data/v1/episodes/{episode_slug}.json', FunimationMetaIE.ie_key())
         episode_id = str(episode['episodePk'])
         display_id = episode.get('slug') or episode_id
 
@@ -346,4 +352,148 @@ class FunimationShowIE(FunimationBaseIE):
                     '%s/%s' % (base_url, vod_item.get('episodeSlug')), FunimationPageIE.ie_key(),
                     vod_item.get('episodeId'), vod_item.get('episodeName'))
                 for vod_item in sorted(vod_items, key=lambda x: x.get('episodeOrder', -1))),
+        }
+
+class FunimationMetaIE(FunimationBaseIE):
+    IE_NAME = 'funimation:meta'
+    _VALID_URL = r'https?://d33et77evd9bgg.cloudfront.net/data/v1/episodes/(?P<id>[^/?#&]+).json'
+
+    def _real_initialize(self):
+        if not self._REGION:
+            FunimationBaseIE._REGION = self._get_region()
+
+    def _get_subtitles(self, subtitles, playback_info):
+        if playback_info:
+            for track in playback_info.get('subtitles'):
+                version = playback_info.get('version')
+                current_sub = {
+                    'url': track.get('filePath'),
+                    'name': join_nonempty(version, track.get('languageCode'), track.get('contentType'))
+                }
+                lang = join_nonempty(track.get('languageCode', 'und'),
+                        version if version != 'Simulcast' else None,
+                        track.get('contentType'), delim='_')
+                if current_sub not in subtitles.get(lang, []):
+                    subtitles.setdefault(lang, []).append(current_sub)
+        return subtitles
+
+    def add_format(self, current_formats, display_id, playback_info):
+        requested_languages, requested_versions = self._configuration_arg('language'), self._configuration_arg('version')
+
+        language_preference = qualities((requested_languages or [''])[::-1])
+        source_preference = qualities((requested_versions or ['uncut', 'simulcast'])[::-1])
+
+        experience_id = playback_info.get('venueVideoId')
+        lang = playback_info.get("audioLanguage")
+        version = playback_info.get("version").capitalize()
+        source_url = playback_info.get('manifestPath')
+        source_type = playback_info.get('fileExt')
+
+        format_name = '%s %s (%s)' % (version, lang, experience_id)
+
+        if source_type == 'm3u8':
+            added_formats = self._extract_m3u8_formats(
+                source_url, display_id, 'mp4', m3u8_id='%s-%s' % (experience_id, 'hls'), fatal=False,
+                note=f'Downloading {format_name} m3u8 information'
+            )
+            for f in added_formats:
+                # TODO: Convert language to code
+                f.update({
+                    'language': lang,
+                    'format_note': version,
+                    'source_preference': source_preference(version.lower()),
+                    'language_preference': language_preference(lang.lower()),
+                })
+            current_formats.extend(added_formats)
+        else:
+            current_formats.append({
+                'format_id': '%s-%s' % (experience_id, source_type),
+                'url': source_url,
+                'language': lang,
+                'format_note': version,
+                'source_preference': source_preference(version.lower()),
+                'language_preference': language_preference(lang.lower()),
+            })
+
+    def _real_extract(self, url):
+        episode_slug = self._match_id(url)
+
+        show_info = self._download_json(url, episode_slug, f'Downloading {episode_slug} JSON')
+
+        episode_id = str(show_info.get('venueId'))
+        display_id = episode_slug or episode_id
+
+        formats, subtitles, thumbnails, duration = [], {}, [], 0
+        requested_languages, requested_versions = self._configuration_arg('language'), self._configuration_arg('version')
+        only_initial_experience = 'seperate-video-versions' in self.get_param('compat_opts', [])
+
+        if not self._TOKEN:
+            self._TOKEN = self._get_cookies("https://www.funimation.com").get('src_token')
+
+        page = []
+        if self._TOKEN:
+            headers = { 'Authorization': 'Token %s' % (self._TOKEN.value) }
+            page = self._download_json('https://playback.prd.funimationsvc.com/v1/play/%s?deviceType=web' % show_info.get('id'), episode_slug, headers=headers, expected_status=403, )
+        else:
+            page = self._download_json('https://playback.prd.funimationsvc.com/v1/play/anonymous/%s?deviceType=web' % show_info.get('id'), episode_slug, expected_status=403, )
+
+        primary_playback = page.get('primary') or {}
+        fallback_playback = page.get('fallback') or []
+
+        if not primary_playback:
+            error = page.get('statusMessage')
+            if error:
+                self.report_warning('%s said: Error %s - %s' % (
+                    self.IE_NAME, page.get('statusCode'), error))
+            else:
+                self.report_warning('No sources found for format')
+        
+        current_formats = []
+        subtitles = {}
+        if primary_playback:
+            self.add_format(current_formats, display_id, primary_playback)
+            self.extract_subtitles(subtitles, primary_playback)
+            
+        if fallback_playback:
+            for fallback in fallback_playback:
+                self.add_format(current_formats, display_id, fallback)
+                self.extract_subtitles(subtitles, fallback)
+
+        for f in current_formats:
+            langCode = f.get("language")
+            version = f.get("format_note")
+            for al in traverse_obj(show_info, ('videoOptions', 'languageByVersion', version.lower(), 'audioLanguages')):
+                if langCode == al.get('languageCode'):
+                    f.update({'language': traverse_obj(al, ('name', 'en'))})
+                    break
+
+        formats.extend(current_formats)
+
+        thumbnails = []
+        for image in show_info.get('images'):
+            if image.get('path'):
+                thumbnails.append({'url': image.get('path')})
+
+        if not formats and (requested_languages or requested_versions):
+            self.raise_no_formats(
+                'There are no video formats matching the requested languages/versions', expected=True, video_id=display_id)
+        self._remove_duplicate_formats(formats)
+
+        return {
+            'id': episode_id,
+            'display_id': display_id,
+            'duration': show_info.get('duration'),
+            'title': traverse_obj(show_info,('name', 'en')),
+            'description': traverse_obj(show_info, ('synopsis', 'en')),
+            'episode': traverse_obj(show_info, ('name', 'en')),
+            'episode_number': int_or_none(show_info.get('episodeNumber')),
+            'episode_id': episode_id,
+            'season': traverse_obj(show_info, ('season', 'name', 'en')),
+            'season_number': int_or_none(traverse_obj(show_info, ('season', 'number'))),
+            'season_id': str_or_none(traverse_obj(show_info, ('season', 'id'))),
+            'series': traverse_obj(show_info, ('show', 'name', 'en')),
+            'formats': formats,
+            'thumbnails': thumbnails,
+            'subtitles': subtitles,
+            '_format_sort_fields': ('lang', 'source'),
         }
